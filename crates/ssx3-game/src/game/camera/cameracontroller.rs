@@ -10,6 +10,8 @@ use crate::call::sp;
 use crate::call::Callee;
 use crate::call::Flow;
 use crate::call::Frame;
+use crate::call::Unwound;
+use crate::call::VSlot;
 use crate::events::back_edge_unwinds;
 use crate::events::deliver_event_here;
 use crate::events::event_due;
@@ -66,6 +68,11 @@ pub const OVERRIDES: &[(u32, GuestFn, &str)] = &[
         0x0015_d050,
         chase_cam_controller_set_algorithm_immediate,
         "ChaseCamController_SetAlgorithmImmediate",
+    ),
+    (
+        0x0015_d078,
+        chase_cam_controller_set_algorithm,
+        "ChaseCamController_SetAlgorithm",
     ),
 ];
 
@@ -351,6 +358,12 @@ pub(crate) mod callee {
         addr: 0x0015_cc70,
         f: ee::s01::f_0015cc70,
     };
+
+    /// `ChaseCamController_PushAlgorithm` (0x161e58).
+    pub const CHASE_CAM_PUSH_ALGORITHM: Callee = Callee {
+        addr: 0x0016_1e58,
+        f: ee::s01::f_00161e58,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +383,313 @@ pub fn chase_cam_controller_set_algorithm_immediate(c: &mut Cpu) {
         frame.close(c);
         Ok(())
     })
+}
+
+/// `cMemMan_alloc` (0x317d70, another shard).
+const MEM_ALLOC: u32 = 0x0031_7d70;
+/// The algorithm id jump table (0x62 entries).
+const ALGORITHM_TABLE: u32 = 0x0045_b5c0;
+const ALGORITHM_COUNT: u64 = 0x62;
+/// The block every case ends in: activate the algorithm and push it.
+const SET_ALGORITHM_PUSH: u32 = 0x0015_d628;
+/// `ChaseCamController::flags` (+0x30): bit 1 makes every switch instant.
+const CHASE_CAM_FLAGS: u32 = 0x30;
+const CHASE_CAM_RIDER: u32 = 0x20;
+
+/// Cases that allocate `size` bytes and run a constructor on them:
+/// (case, cycles, size, name offset below 0x460000, constructor).
+const PLAIN_ALGORITHMS: &[(u32, u64, u64, u32, u32)] = &[
+    (0x0015_d23c, 10, 0x390, 0x4cd8, 0x0016_16a8), // IdleChaseCameraAlgorithm
+    (0x0015_d264, 10, 0x390, 0x4cb8, 0x0016_89c8),
+    (0x0015_d28c, 10, 0x390, 0x4c90, 0x0016_8cd8),
+    (0x0015_d2b4, 10, 0x390, 0x4c70, 0x0016_0438), // ManualChaseCameraAlgorithm
+    (0x0015_d2dc, 10, 0x390, 0x4c50, 0x0016_82b8),
+    (0x0015_d430, 10, 0x390, 0x4af0, 0x0016_8650),
+    (0x0015_d458, 10, 0x3a0, 0x4ac8, 0x0016_0760), // MatrixChaseCameraAlgorithm
+    (0x0015_d4b8, 10, 0x390, 0x4d28, 0x0017_6a68),
+    (0x0015_d4e0, 10, 0x390, 0x4d00, 0x0017_7068),
+    (0x0015_d508, 10, 0x390, 0x4d50, 0x0017_6d68),
+    (0x0015_d530, 10, 0x3a0, 0x4a88, 0x0017_7e50),
+];
+
+/// Cases of the 0x1774c0 algorithm, one per variant 0..7:
+/// (case, cycles, name offset below 0x460000).
+const VARIANT_ALGORITHMS: &[(u32, u64, u32)] = &[
+    (0x0015_d304, 9, 0x4c30),
+    (0x0015_d328, 9, 0x4c08),
+    (0x0015_d34c, 9, 0x4be0),
+    (0x0015_d370, 9, 0x4bb8),
+    (0x0015_d394, 9, 0x4b90),
+    (0x0015_d3b8, 9, 0x4b68),
+    (0x0015_d3dc, 9, 0x4b40),
+    (0x0015_d400, 8, 0x4b18),
+];
+
+/// `RelativeChaseCameraAlgorithm` cases with a fixed distance from the
+/// game's constants: (case, cycles, offset below gp).
+const RELATIVE_ALGORITHMS: &[(u32, u64, u32)] = &[
+    (0x0015_d58c, 9, 0x6cd0),
+    (0x0015_d5b0, 9, 0x6ccc),
+    (0x0015_d5d4, 9, 0x6cc8),
+    (0x0015_d5f8, 8, 0x6cc4),
+];
+
+/// `cMemMan_alloc(size, 0x460000 - name, 0x20000000, 0)`: the algorithm's
+/// memory, named after its class.
+fn alloc_algorithm(c: &mut Cpu, size: u64, name: u32, ret: u32) -> Flow {
+    c.g[A0][0] = size;
+    c.g[A1][0] = sx(0x46_0000u32.wrapping_sub(name));
+    c.g[A2][0] = 0x2000_0000;
+    c.g[A3][0] = 0;
+    call_ptr(c, MEM_ALLOC, ret)
+}
+
+/// `void ChaseCamController_SetAlgorithm(ChaseCamController* cam, int id,
+/// void* params, float rate f12)` (0x15d078): build camera algorithm `id`
+/// (0..0x61, through its jump table; other ids push a null algorithm) and
+/// push it onto the controller's blend list. `rate` is the per-tick blend
+/// step the list node keeps; bit 1 of the flags (+0x30) makes it 1.0
+/// (instant). The rate is the caller's: converted callers pass a step
+/// already scaled to the tick rate (`camera::blend_rate_60`), mission and
+/// script data keep their authored rates, so it is forwarded unchanged.
+pub fn chase_cam_controller_set_algorithm(c: &mut Cpu) {
+    guest(c, |c| {
+        c.cycles += 19;
+        let frame = Frame::open(c, 0xd0);
+        frame.save(c, S0, 0xb0);
+        frame.save(c, S1, 0xa0);
+        c.g[S0][0] = 0;
+        frame.save(c, S5, 0x60);
+        c.g[S1][0] = c.g[A1][0];
+        frame.save(c, S6, 0x50);
+        c.g[S5][0] = c.g[A2][0];
+        frame.save_fpr(c, 21, 0xc8);
+        c.g[S6][0] = c.g[A0][0];
+        frame.save(c, S2, 0x90);
+        frame.save(c, S3, 0x80);
+        frame.save(c, S4, 0x70);
+        frame.save_ra(c, 0x40);
+        frame.save_fpr(c, 20, 0xc0);
+        let flags = Addr((c.g[S6][0] as u32).wrapping_add(CHASE_CAM_FLAGS)).lw(c);
+        c.g[V0][0] = flags & 2;
+        let instant = c.g[V0][0] != 0;
+        c.mov_s(21, 12);
+        if instant {
+            c.cycles += 2;
+            c.g[AT][0] = 0x3f80_0000;
+            c.mtc1(AT, 21);
+        }
+
+        c.cycles += 3;
+        let in_table = c.g[S1][0] < ALGORITHM_COUNT;
+        c.g[V0][0] = 0x46_0000;
+        if in_table {
+            c.cycles += 6;
+            c.g[V1][0] = sx((c.g[S1][0] as u32) << 2);
+            c.g[V0][0] = sx(ALGORITHM_TABLE);
+            c.g[V1][0] = sx((c.g[V1][0] as u32).wrapping_add(ALGORITHM_TABLE));
+            c.g[A0][0] = Addr(c.g[V1][0] as u32).lw(c);
+            let case = c.g[A0][0] as u32;
+            if !build_algorithm(c, case)? {
+                c.jump_out(case, 0x0015_d078, 0x0015_d694);
+                return Ok(());
+            }
+        }
+
+        // 0x15d628: start the algorithm (vtable slot +0x60, with the rider),
+        // push it with the rate, then its slot +0x20.
+        c.cycles += 27;
+        c.g[V0][0] = Addr((c.g[S0][0] as u32).wrapping_add(0x10)).lw(c);
+        c.g[A1][0] = Addr((c.g[S6][0] as u32).wrapping_add(CHASE_CAM_RIDER)).lw(c);
+        let start = VSlot::read(c, c.g[V0][0], 0x60);
+        c.g[V1][0] = start.func;
+        c.g[A0][0] = start.this(c.g[S0][0]);
+        call_ptr(c, start.func as u32, 0x0015_d640)?;
+        c.g[A0][0] = c.g[S6][0];
+        c.mov_s(12, 21);
+        c.g[A1][0] = c.g[S0][0];
+        callee::CHASE_CAM_PUSH_ALGORITHM.call(c, 0x0015_d650)?;
+        c.g[V0][0] = Addr((c.g[S0][0] as u32).wrapping_add(0x10)).lw(c);
+        let pushed = VSlot::read(c, c.g[V0][0], 0x20);
+        c.g[V1][0] = pushed.func;
+        c.g[A0][0] = pushed.this(c.g[S0][0]);
+        call_ptr(c, pushed.func as u32, 0x0015_d664)?;
+
+        frame.restore(c, S0, 0xb0);
+        frame.restore(c, S1, 0xa0);
+        frame.restore(c, S2, 0x90);
+        frame.restore(c, S3, 0x80);
+        frame.restore(c, S4, 0x70);
+        frame.restore(c, S5, 0x60);
+        frame.restore(c, S6, 0x50);
+        frame.restore_ra(c, 0x40);
+        frame.restore_fpr(c, 21, 0xc8);
+        frame.restore_fpr(c, 20, 0xc0);
+        frame.close(c);
+        Ok(())
+    })
+}
+
+/// One case of `ChaseCamController_SetAlgorithm`'s jump table: build the
+/// algorithm into `s0` (left 0 by the empty cases). `false` if `case` is not
+/// one of the function's own blocks.
+fn build_algorithm(c: &mut Cpu, case: u32) -> Result<bool, Unwound> {
+    if let Some(&(_, cycles, size, name, ctor)) = PLAIN_ALGORITHMS.iter().find(|a| a.0 == case) {
+        c.cycles += cycles;
+        alloc_algorithm(c, size, name, case + 0x18)?;
+        c.g[A0][0] = c.g[V0][0];
+        call_ptr(c, ctor, case + 0x20)?;
+        c.g[S0][0] = c.g[V0][0];
+        return Ok(true);
+    }
+    if let Some(variant) = VARIANT_ALGORITHMS.iter().position(|a| a.0 == case) {
+        let (_, cycles, name) = VARIANT_ALGORITHMS[variant];
+        c.cycles += cycles;
+        alloc_algorithm(c, 0x3a0, name, case + 0x18)?;
+        c.g[A0][0] = c.g[V0][0];
+        c.g[A1][0] = variant as u64;
+        c.cycles += 4;
+        call_ptr(c, 0x0017_74c0, 0x0015_d428)?;
+        c.g[S0][0] = c.g[V0][0];
+        return Ok(true);
+    }
+    if let Some(&(_, cycles, distance)) = RELATIVE_ALGORITHMS.iter().find(|a| a.0 == case) {
+        c.cycles += cycles;
+        alloc_algorithm(c, 0x3c0, 0x4aa8, case + 0x18)?;
+        let at = (c.g[GP][0] as u32).wrapping_sub(distance);
+        c.lwc1(12, at);
+        c.g[A0][0] = c.g[V0][0];
+        relative_algorithm(c)?;
+        return Ok(true);
+    }
+    match case {
+        // A track-spline algorithm (0x178520) when the params' track data
+        // (+8) is a spline (type 2) and the career has 10 or more events
+        // (or none), else the 0x174190 algorithm holding `params`.
+        0x0015_d0f0 => {
+            c.cycles += 6;
+            c.g[V0][0] = Addr((c.g[GP][0] as u32).wrapping_sub(0x848)).lw(c);
+            c.g[V1][0] = Addr((c.g[V0][0] as u32).wrapping_add(0x84)).lw(c);
+            c.g[A0][0] = Addr((c.g[V1][0] as u32).wrapping_add(0x28)).lw(c);
+            c.g[A0][0] = Addr(c.g[A0][0] as u32).lw(c);
+            c.g[A1][0] = 0;
+            if c.g[A0][0] != 0 {
+                c.cycles += 1;
+                c.g[A1][0] = ((c.g[A0][0] as i64) < 10) as u64;
+            }
+            c.cycles += 2;
+            let mut spline = false;
+            if c.g[A1][0] == 0 {
+                c.cycles += 5;
+                c.g[S2][0] = Addr((c.g[S5][0] as u32).wrapping_add(8)).lw(c);
+                c.g[V1][0] = 2;
+                c.g[V0][0] = Addr((c.g[S2][0] as u32).wrapping_add(0x28)).lw(c);
+                spline = c.g[V0][0] == c.g[V1][0];
+            }
+            c.g[A1][0] = 0x46_0000;
+            if spline {
+                c.cycles += 20;
+                alloc_algorithm(c, 0x3b0, 0x4db0, 0x0015_d140)?;
+                c.g[S1][0] = c.g[V0][0];
+                c.g[A0][0] = c.g[SP][0];
+                c.g[A1][0] = c.g[S2][0];
+                call_ptr(c, 0x0017_0240, 0x0015_d150)?;
+                c.g[S0][0] = sx(sp(c).wrapping_add(0x10));
+                c.g[A1][0] = c.g[S2][0];
+                c.g[A0][0] = c.g[S0][0];
+                call_ptr(c, 0x0017_07b0, 0x0015_d160)?;
+                c.g[A2][0] = c.g[S0][0];
+                c.g[A0][0] = c.g[S1][0];
+                c.g[A1][0] = c.g[SP][0];
+                call_ptr(c, 0x0017_8520, 0x0015_d170)?;
+                c.g[S0][0] = c.g[V0][0];
+            } else {
+                c.cycles += 10;
+                alloc_algorithm(c, 0x90, 0x4d88, 0x0015_d18c)?;
+                c.g[A0][0] = c.g[V0][0];
+                call_ptr(c, 0x0017_4190, 0x0015_d194)?;
+                c.g[S0][0] = c.g[V0][0];
+                Addr((c.g[S0][0] as u32).wrapping_add(0x80)).sw(c, c.g[S5][0]);
+            }
+        }
+        // `SplineCameraAlgorithm` through the four control points of the
+        // params' spline (+8), with the timing at params +0x10..+0x1c.
+        0x0015_d1a0 => {
+            c.cycles += 39;
+            c.g[S0][0] = Addr((c.g[S5][0] as u32).wrapping_add(8)).lw(c);
+            alloc_algorithm(c, 0x3d0, 0x4d68, 0x0015_d1bc)?;
+            c.g[S4][0] = c.g[V0][0];
+            c.g[A0][0] = c.g[SP][0];
+            c.g[A1][0] = c.g[S0][0];
+            c.g[A2][0] = 0;
+            call_ptr(c, 0x0017_0d20, 0x0015_d1d0)?;
+            let points = [
+                (S3, 0x10, 0x0015_d1e4),
+                (S2, 0x20, 0x0015_d1f8),
+                (S1, 0x30, 0x0015_d20c),
+            ];
+            for (i, &(reg, off, ret)) in points.iter().enumerate() {
+                c.g[reg][0] = sx(sp(c).wrapping_add(off));
+                c.g[A1][0] = c.g[S0][0];
+                c.g[A0][0] = c.g[reg][0];
+                c.g[A2][0] = i as u64 + 1;
+                call_ptr(c, 0x0017_0d20, ret)?;
+            }
+            let params = c.g[S5][0] as u32;
+            c.lwc1(15, params.wrapping_add(0x10));
+            c.g[A0][0] = c.g[S4][0];
+            c.lwc1(12, params.wrapping_add(0x18));
+            c.g[A2][0] = c.g[S3][0];
+            c.lwc1(13, params.wrapping_add(0x14));
+            c.g[A3][0] = c.g[S2][0];
+            c.lwc1(14, params.wrapping_add(0x1c));
+            c.g[T0][0] = c.g[S1][0];
+            c.g[A1][0] = c.g[SP][0];
+            call_ptr(c, 0x0016_1060, 0x0015_d234)?;
+            c.g[S0][0] = c.g[V0][0];
+        }
+        // `RelativeChaseCameraAlgorithm` at (id - 0x21) times the distance
+        // step at gp-0x6cd4.
+        0x0015_d480 => {
+            c.cycles += 14;
+            c.g[V0][0] = sx((c.g[S1][0] as u32).wrapping_sub(0x21));
+            let step = (c.g[GP][0] as u32).wrapping_sub(0x6cd4);
+            c.lwc1(0, step);
+            c.mtc1(V0, 20);
+            c.cvt_s_w(20, 20);
+            c.mul_s(20, 20, 0);
+            alloc_algorithm(c, 0x3c0, 0x4aa8, 0x0015_d4ac)?;
+            c.g[A0][0] = c.g[V0][0];
+            c.mov_s(12, 20);
+            relative_algorithm(c)?;
+        }
+        0x0015_d558 => {
+            c.cycles += 2;
+            c.g[S0][0] = 0;
+        }
+        // `Post_Race_1ChaseCameraAlgorithm` for the controller's rider.
+        0x0015_d560 => {
+            c.cycles += 11;
+            alloc_algorithm(c, 0x3b0, 0x4a68, 0x0015_d578)?;
+            c.g[A1][0] = Addr((c.g[S6][0] as u32).wrapping_add(CHASE_CAM_RIDER)).lw(c);
+            c.g[A0][0] = c.g[V0][0];
+            call_ptr(c, 0x0017_89e8, 0x0015_d584)?;
+            c.g[S0][0] = c.g[V0][0];
+        }
+        SET_ALGORITHM_PUSH => {}
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// 0x15d618: `RelativeChaseCameraAlgorithm_ctor(a0, distance f12)`, then
+/// keep the id at +0xc.
+fn relative_algorithm(c: &mut Cpu) -> Flow {
+    c.cycles += 4;
+    call_ptr(c, 0x0016_0b70, 0x0015_d620)?;
+    c.g[S0][0] = c.g[V0][0];
+    Addr((c.g[S0][0] as u32).wrapping_add(0xc)).sw(c, c.g[S1][0]);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +1081,164 @@ pub(crate) mod tests {
                 c.g[A2][0] = sx(DATA + 0x400);
             },
         );
+    }
+
+    /// Every block `ChaseCamController_SetAlgorithm`'s jump table can name,
+    /// and 0 (outside the function: `jump_out`).
+    const SET_ALGORITHM_CASES: &[u32] = &[
+        0x0015_d0f0,
+        0x0015_d1a0,
+        0x0015_d23c,
+        0x0015_d264,
+        0x0015_d28c,
+        0x0015_d2b4,
+        0x0015_d2dc,
+        0x0015_d304,
+        0x0015_d328,
+        0x0015_d34c,
+        0x0015_d370,
+        0x0015_d394,
+        0x0015_d3b8,
+        0x0015_d3dc,
+        0x0015_d400,
+        0x0015_d430,
+        0x0015_d458,
+        0x0015_d480,
+        0x0015_d4b8,
+        0x0015_d4e0,
+        0x0015_d508,
+        0x0015_d530,
+        0x0015_d558,
+        0x0015_d560,
+        0x0015_d58c,
+        0x0015_d5b0,
+        0x0015_d5d4,
+        0x0015_d5f8,
+        0x0015_d628,
+        0,
+    ];
+
+    /// A chase camera at `DATA` (flags `flags`, rider at `+0x20`, an algorithm
+    /// list at `+8` holding one algorithm), the main heap, and the dummy world.
+    fn chase_cam_fixture(c: &mut Cpu, flags: u32) -> u32 {
+        alloc_ready(c);
+        be_library(c);
+        let cam = DATA;
+        let list = DATA + 0x600;
+        clear(c, cam, 0x40);
+        clear(c, list, 0x10);
+        c.bus.write32(cam + 8, list);
+        c.bus.write32(cam + 0x20, DATA + 0x700);
+        c.bus.write32(cam + 0x30, flags);
+        c.bus.write32(list + 4, 1);
+        c.g[A0][0] = sx(cam);
+        cam
+    }
+
+    #[test]
+    fn chase_cam_controller_set_algorithm_matches() {
+        check(
+            ee::s01::f_0015d078__generated,
+            chase_cam_controller_set_algorithm,
+            300,
+            &|c, seed| {
+                let mut r = machine(c, seed, 0x15d0_78, 4);
+                let flags = r.next_u32() & 3;
+                chase_cam_fixture(c, flags);
+                // The id: in the table (its entry one of the cases) or not.
+                let id = match seed % 8 {
+                    0 => 0x62 + r.next_u32() % 0x100,
+                    1 => r.next_u32() | 0x8000_0000,
+                    _ => r.next_u32() % 0x62,
+                };
+                c.g[A1][0] = sx(id);
+                let case = SET_ALGORITHM_CASES[seed as usize % SET_ALGORITHM_CASES.len()];
+                if id < 0x62 {
+                    c.bus.write32(ALGORITHM_TABLE + 4 * id, case);
+                }
+                // Params: the track spline (+8, type 2 at +0x28 or not) and
+                // the timing floats.
+                let params = DATA + 0x800;
+                let spline = DATA + 0x900;
+                clear(c, spline, 0x40);
+                c.bus.write32(params + 8, spline);
+                c.bus.write32(
+                    spline + 0x28,
+                    if seed % 3 == 0 { 2 } else { r.next_u32() % 4 },
+                );
+                for k in 0..4 {
+                    c.bus.write32(params + 0x10 + 4 * k, r.f32(10.0));
+                }
+                c.g[A2][0] = sx(params);
+                // The career's event count (none, under 10, 10 or more).
+                let world = DATA + 0xa00;
+                let module = DATA + 0xb00;
+                let career = DATA + 0xc00;
+                c.bus.write32(GAME_GP.wrapping_sub(0x848), world);
+                c.bus.write32(world + 0x84, module);
+                c.bus.write32(module + 0x28, career);
+                c.bus.write32(career, [0, 3, 12][(seed / 3) as usize % 3]);
+                // The relative distances.
+                for off in [0x6cd4, 0x6cd0, 0x6ccc, 0x6cc8, 0x6cc4] {
+                    c.bus.write32(GAME_GP.wrapping_sub(off), r.f32(20.0));
+                }
+                c.f[12] = if seed % 5 == 0 {
+                    0x3f80_0000
+                } else {
+                    r.f32(1.0)
+                };
+                // The fixture's heap setup ran a function: enter at the top.
+                c.pc = 0x0015_d078;
+            },
+        );
+    }
+
+    /// The blend rate reaches the list node unchanged, so a converted
+    /// caller's rate (`camera::blend_rate_60`) blends over the same time at
+    /// any tick rate: one second at 1/60 per 60 Hz tick takes 120 ticks at
+    /// 120. Bit 1 of the flags still makes the switch instant.
+    #[test]
+    fn chase_cam_controller_set_algorithm_rate() {
+        use crate::game::camera::camera::blend_rate_60;
+        use crate::ps2f::FpuF32;
+        let raw = FpuF32::from_f32(1.0 / 60.0);
+        let node_after = |hz: u32, flags: u32| {
+            let mut c = crate::difftest::fresh();
+            machine(&mut c, 1, 0x15d0_78, 0);
+            crate::tick::set_for_test(&mut c, hz);
+            let cam = chase_cam_fixture(&mut c, flags);
+            c.g[A1][0] = 0x62; // no new algorithm: the push alone
+            c.f[12] = blend_rate_60(&mut c, raw).0;
+            c.g[RA][0] = TEST_RA as u64;
+            c.pc = 0x0015_d078;
+            chase_cam_controller_set_algorithm(&mut c);
+            assert_eq!(c.pc, TEST_RA);
+            let list = c.bus.read32(cam + 8);
+            let node = c.bus.read32(list);
+            (
+                FpuF32(c.bus.read32(node + 4)),
+                FpuF32(c.bus.read32(node + 8)),
+            )
+        };
+        let ticks_to_blend = |rate: FpuF32| {
+            let mut w = FpuF32::ZERO;
+            let mut n = 0;
+            while w.to_f32() < 1.0 {
+                w = w + rate;
+                n += 1;
+            }
+            n
+        };
+        let (w60, rate60) = node_after(60, 0);
+        assert_eq!((w60, rate60), (FpuF32::ZERO, raw), "60 Hz unchanged");
+        let (_, rate120) = node_after(120, 0);
+        let (t60, t120) = (ticks_to_blend(rate60), ticks_to_blend(rate120));
+        assert!(
+            (t120 as i32 - 2 * t60 as i32).abs() <= 1,
+            "{t60} vs {t120} ticks"
+        );
+        let (w, rate) = node_after(120, 2);
+        assert_eq!((w, rate), (FpuF32::ONE, FpuF32::ONE), "instant at any rate");
     }
 
     // -----------------------------------------------------------------------

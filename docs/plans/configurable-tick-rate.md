@@ -389,7 +389,7 @@ lockstep session would need both peers at one rate anyway.
 
 | Where | What | Why it needs a decision |
 | --- | --- | --- |
-| `ChaseCamController_Update` (0x161bb8) blend weights | `w += rate` per update | Classified per caller in `docs/plans/tick/chasecam-callers.tsv`; the two raw per-tick rates are converted at their callers. What remains is `ChaseCamController_SetAlgorithm` (0x15d078), still generated: the node rate is written inside it, so its end-to-end rate test needs that port. Mission/script rates are authored data and stay. |
+| `ChaseCamController_Update` (0x161bb8) blend weights | `w += rate` per update | Classified per caller in `docs/plans/tick/chasecam-callers.tsv`; the two raw per-tick rates are converted at their callers. `ChaseCamController_SetAlgorithm` (0x15d078) is ported and forwards the rate unchanged to the list node; its rate test checks a converted caller's blend takes the same time at 120. Mission/script rates are authored data and stay. |
 | `tick::ui_frame_due` (credits scroll) under catch-up | the gate reads the VSync counter, so several updates queued per VSync advance one 60 Hz frame (average correct, jitter ≤ 1 frame) | Only affects a host slower than the game rate; the 60 Hz path is always true and unchanged. |
 
 
